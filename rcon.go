@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"sync/atomic"
 	"time"
 )
 
@@ -88,6 +89,9 @@ var (
 	// ErrMultiErrorOccurred is returned when close connection failed with
 	// error after auth failed.
 	ErrMultiErrorOccurred = errors.New("an error occurred while handling another error")
+	ErrExecuteTimeout     = errors.New("execute timeout")
+
+	serverDataId atomic.Int32
 )
 
 // Conn is source RCON generic stream-oriented network connection.
@@ -124,11 +128,24 @@ func Dial(address string, password string, options ...Option) (*Conn, error) {
 	return &client, nil
 }
 
+func (c *Conn) generateServerDataId() int32 {
+	dataId := serverDataId.Add(1)
+	if dataId >= 1000 {
+		serverDataId.Store(1)
+	}
+	return dataId
+}
+
+type executeResponse struct {
+	Resp string
+	Err  error
+}
+
 // Execute sends command type and it string to execute to the remote server,
 // creating a packet with a SERVERDATA_EXECCOMMAND_ID for the server to mirror,
 // and compiling its payload bytes in the appropriate order. The response body
 // is decompiled from bytes into a string for return.
-func (c *Conn) Execute(command string) (string, error) {
+func (c *Conn) Execute(command string, timeout ...int) (string, error) {
 	if command == "" {
 		return "", ErrCommandEmpty
 	}
@@ -137,20 +154,56 @@ func (c *Conn) Execute(command string) (string, error) {
 		return "", ErrCommandTooLong
 	}
 
-	if err := c.write(SERVERDATA_EXECCOMMAND, SERVERDATA_EXECCOMMAND_ID, command); err != nil {
+	var (
+		redTimeout int = 3000
+	)
+
+	if len(timeout) > 0 {
+		redTimeout = timeout[0]
+	}
+
+	serverPacketID := c.generateServerDataId()
+
+	if err := c.write(SERVERDATA_EXECCOMMAND, serverPacketID, command); err != nil {
 		return "", err
 	}
+	responseChan := make(chan executeResponse, 1)
+	go func() {
+		for {
+			response, err := c.read()
+			if response.ID != serverPacketID {
+				continue
+			}
+			if err != nil {
+				responseChan <- executeResponse{
+					Resp: response.Body(),
+					Err:  err,
+				}
+				return
+			}
 
-	response, err := c.read()
-	if err != nil {
-		return response.Body(), err
+			//if response.ID != serverPacketID {
+			//	responseChan <- executeResponse{
+			//		Resp: response.Body(),
+			//		Err:  ErrInvalidPacketID,
+			//	}
+			//	return
+			//}
+
+			responseChan <- executeResponse{
+				Resp: response.Body(),
+			}
+			return
+			//return response.Body(), nil
+		}
+	}()
+
+	select {
+	case <-time.After(time.Duration(redTimeout) * time.Millisecond):
+		return "", ErrExecuteTimeout
+	case res := <-responseChan:
+		return res.Resp, res.Err
 	}
-
-	if response.ID != SERVERDATA_EXECCOMMAND_ID {
-		return response.Body(), ErrInvalidPacketID
-	}
-
-	return response.Body(), nil
 }
 
 // LocalAddr returns the local network address.
