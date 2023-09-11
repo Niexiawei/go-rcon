@@ -155,7 +155,7 @@ func (c *Conn) Execute(command string, timeout ...int) (string, error) {
 	}
 
 	var (
-		redTimeout int = 3000
+		redTimeout = 3000
 	)
 
 	if len(timeout) > 0 {
